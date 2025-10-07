@@ -3,9 +3,9 @@ uvicorn
 moviepy
 soundfile
 noisereduce
+librosa
 numpy
 scipy
-python-multipart
 pydub
-imageio
 imageio-ffmpeg
+python-multipart
