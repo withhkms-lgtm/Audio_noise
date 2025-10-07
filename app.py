@@ -1,20 +1,30 @@
 import os
-import shutil
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse
-import uvicorn
+import io
+import numpy as np
 import soundfile as sf
 import noisereduce as nr
-import numpy as np
 import scipy.signal as signal
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
+from moviepy.editor import VideoFileClip
+import imageio_ffmpeg
+from pydub import AudioSegment
 
-# 폴더 설정
+# pydub가 ffmpeg를 못 찾는 이슈 방지: imageio-ffmpeg 바이너리로 지정
+AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
+
+app = FastAPI()
+
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-app = FastAPI()
+def to_mono(x: np.ndarray) -> np.ndarray:
+    if x.ndim > 1:
+        return np.mean(x, axis=1)
+    return x
 
 @app.post("/upload")
 async def upload_file(
@@ -23,50 +33,76 @@ async def upload_file(
     apply_comp: bool = Form(False),
     apply_norm: bool = Form(False)
 ):
-    # 업로드 파일 저장
+    # 1) 업로드 저장
     input_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(input_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(await file.read())
 
-    # 오디오 불러오기
-    data, sr = sf.read(input_path)
+    base, ext = os.path.splitext(file.filename)
+    ext = ext.lower()
+    raw_wav_path = os.path.join(OUTPUT_DIR, base + "_raw.wav")
 
-    # 노이즈 제거
-    reduced = nr.reduce_noise(y=data, sr=sr)
+    # 2) 먼저 "영상으로 취급" 시도 → 실패하면 "오디오"로 폴백
+    used_method = None
+    try:
+        # 🎬 영상(또는 컨테이너)로 가정하고 오디오 뽑기
+        clip = VideoFileClip(input_path)
+        if clip.audio is None:
+            raise RuntimeError("No audio stream in video")
+        clip.audio.write_audiofile(raw_wav_path, codec="pcm_s16le", verbose=False, logger=None)
+        clip.close()
+        used_method = "moviepy"
+    except Exception as e_video:
+        # 🎵 오디오 파일로 폴백
+        try:
+            data, sr = sf.read(input_path)
+            sf.write(raw_wav_path, data, sr)
+            used_method = "soundfile"
+        except Exception as e_audio:
+            return JSONResponse(
+                {"error": f"이 파일을 오디오로 읽을 수 없어요. (video err: {e_video}, audio err: {e_audio})"},
+                status_code=400
+            )
 
-    # EQ 적용 (대역 통과 필터)
+    # 3) 오디오 로드
+    data, sr = sf.read(raw_wav_path)
+    data = to_mono(data).astype(np.float32)
+
+    # 4) 노이즈 제거 (기본 강도 0.7)
+    reduced = nr.reduce_noise(y=data, sr=sr, prop_decrease=0.7)
+
+    # 5) EQ (100Hz ~ 8kHz 대역)
     if apply_eq:
-        b, a = signal.butter(4, [100/(sr/2), 8000/(sr/2)], btype="band")
+        b, a = signal.butter(4, [100/(sr/2), 8000/(sr/2)], btype='band')
         reduced = signal.lfilter(b, a, reduced)
 
-    # Compressor 적용 (간단 버전)
+    # 6) Compressor (간단 소프트 니)
     if apply_comp:
-        threshold = 0.1
+        thr = 0.1
         ratio = 4.0
-        reduced = np.where(np.abs(reduced) > threshold,
-                           np.sign(reduced) * (threshold + (np.abs(reduced) - threshold) / ratio),
-                           reduced)
+        mag = np.abs(reduced)
+        sign = np.sign(reduced)
+        over = mag > thr
+        reduced = np.where(over, sign * (thr + (mag - thr)/ratio), reduced)
 
-    # Normalization 적용
+    # 7) Normalization
     if apply_norm:
-        reduced = reduced / max(abs(reduced))
+        peak = float(np.max(np.abs(reduced)) or 1.0)
+        reduced = reduced / peak
 
-    # 최종 MP3 저장
-    final_path = os.path.join(OUTPUT_DIR, "final.mp3")
-    sf.write(final_path, reduced, sr, format="MP3")
+    # 8) WAV → MP3 변환 (pydub + imageio-ffmpeg)
+    final_wav = os.path.join(OUTPUT_DIR, "final.wav")
+    sf.write(final_wav, reduced, sr, subtype="PCM_16")  # WAV로 먼저 안전 저장
 
-    return FileResponse(final_path, media_type="audio/mpeg", filename="final.mp3")
-
+    final_mp3 = os.path.join(OUTPUT_DIR, "final.mp3")
+    try:
+        AudioSegment.from_file(final_wav, format="wav").export(final_mp3, format="mp3")
+        # MP3가 성공했으면 그걸 반환
+        return FileResponse(final_mp3, media_type="audio/mpeg", filename="final.mp3")
+    except Exception as e_mp3:
+        # 혹시 mp3 인코딩 실패 시 WAV라도 반환
+        return FileResponse(final_wav, media_type="audio/wav", filename="final.wav")
 
 @app.get("/")
 def home():
-    return {"message": "노이즈 제거 + 오디오 보정 API"}
-
-
-# ✅ Render에서 실행 진입점
-import os
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Render가 PORT 환경변수 전달
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    return {"message": "영상/오디오 업로드 → 노이즈 제거 + EQ/Comp/Norm 적용 API"}
