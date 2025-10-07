@@ -6,3 +6,4 @@ librosa
 soundfile
 imageio-ffmpeg
 pydub
+python-multipart
