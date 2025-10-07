@@ -1,9 +1,9 @@
 fastapi
 uvicorn
-moviepy
+python-multipart
+pydub
+numpy
+scipy
+soundfile
 noisereduce
 librosa
-soundfile
-imageio-ffmpeg
-pydub
-python-multipart
