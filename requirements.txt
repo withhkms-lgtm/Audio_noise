@@ -1,7 +1,11 @@
 fastapi
 uvicorn
+python-multipart
 moviepy
-librosa
 noisereduce
+librosa
 soundfile
 numpy
+scipy
+imageio
+imageio-ffmpeg
